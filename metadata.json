@@ -1,0 +1,6 @@
+{
+  "name": "Better DeepSeek",
+  "description": "Official native Android host for Better DeepSeek, wrapping chat.deepseek.com with injected custom tooling, code sandbox, file export, and native bridge.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
