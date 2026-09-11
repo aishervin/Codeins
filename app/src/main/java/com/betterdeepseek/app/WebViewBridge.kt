@@ -31,6 +31,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import com.betterdeepseek.app.github.GitHubAgentPrompt
 
 /** File entry returned by the native Android picker to JavaScript. */
 internal data class PickedFile(
@@ -227,6 +228,9 @@ class WebViewBridge(
      * Mode is "files" or "folder"; requestId is the JS correlation key.
      */
     @Volatile var onPickFiles: ((mode: String, requestId: String) -> Unit)? = null
+
+    /** Set by MainActivity to open the GitHub Agent settings bottom sheet. */
+    @Volatile var onOpenGitHubSettings: (() -> Unit)? = null
 
     /**
      * Returns the last DeepSeek page theme written by the extension's theme.js via
@@ -571,6 +575,36 @@ class WebViewBridge(
     }
 
     @JavascriptInterface
+    fun openGitHubSettings() {
+        mainHandler.post { onOpenGitHubSettings?.invoke() }
+    }
+
+    @JavascriptInterface
+    fun getGitHubStatus(): String {
+        val githubPrefs = context.getSharedPreferences("bds_github_prefs", Context.MODE_PRIVATE)
+        val token = githubPrefs.getString("githubToken", null)
+            ?: prefs.getString("githubToken", null)
+        val user = githubPrefs.getString("github_user_login", "") ?: ""
+        val repo = githubPrefs.getString("github_target_repo", "") ?: ""
+        val branch = githubPrefs.getString("github_target_branch", "main") ?: "main"
+        val writeEnabled = githubPrefs.getBoolean("github_agent_write_enabled", true)
+        val promptEnabled = githubPrefs.getBoolean("github_prompt_injection_enabled", true)
+
+        val obj = JSONObject().apply {
+            put("connected", !token.isNullOrBlank())
+            put("username", user)
+            put("targetRepo", repo)
+            put("targetBranch", branch)
+            put("canWrite", writeEnabled)
+            put("promptEnabled", promptEnabled)
+            if (!token.isNullOrBlank() && promptEnabled) {
+                put("systemPrompt", GitHubAgentPrompt.buildAgentSystemPrompt(user, repo, branch, writeEnabled))
+            }
+        }
+        return obj.toString()
+    }
+
+    @JavascriptInterface
     fun getAssetUrl(relativePath: String?): String {
         val authority = context.getString(R.string.bds_asset_authority)
         val cleaned = (relativePath ?: "").trimStart('/')
@@ -724,6 +758,12 @@ class WebViewBridge(
                 "bds-fetch-url" -> handleFetchUrl(payload, response)
                 "bds-fetch-github-zip" -> handleFetchGithubZip(payload, response)
                 "bds-fetch-github-commits" -> handleFetchGithubCommits(payload, response)
+                "bds-github-agent-status" -> handleFetchGithubAgentStatus(response)
+                "bds-github-list-repos" -> handleFetchGithubListRepos(payload, response)
+                "bds-github-get-file" -> handleFetchGithubGetFile(payload, response)
+                "bds-github-commit-file" -> handleFetchGithubCommitFile(payload, response)
+                "bds-github-create-branch" -> handleFetchGithubCreateBranch(payload, response)
+                "bds-github-create-pr" -> handleFetchGithubCreatePR(payload, response)
                 "bds-get-youtube-transcript" -> {
                     response.put("ok", false)
                     response.put(
@@ -895,6 +935,285 @@ class WebViewBridge(
         if (httpEquiv != null) return httpEquiv.groupValues[1]
 
         return null
+    }
+
+    private fun getEffectiveGithubToken(payload: JSONObject): String? {
+        val payloadToken = payload.optString("token").trim()
+        if (payloadToken.isNotEmpty()) return payloadToken
+        val githubPrefs = context.getSharedPreferences("bds_github_prefs", Context.MODE_PRIVATE)
+        return githubPrefs.getString("githubToken", null)
+            ?: prefs.getString("githubToken", null)?.takeIf { it.isNotBlank() }
+    }
+
+    private fun handleFetchGithubAgentStatus(response: JSONObject) {
+        val githubPrefs = context.getSharedPreferences("bds_github_prefs", Context.MODE_PRIVATE)
+        val token = githubPrefs.getString("githubToken", null) ?: prefs.getString("githubToken", null)
+        val user = githubPrefs.getString("github_user_login", "") ?: ""
+        val repo = githubPrefs.getString("github_target_repo", "") ?: ""
+        val branch = githubPrefs.getString("github_target_branch", "main") ?: "main"
+        val writeEnabled = githubPrefs.getBoolean("github_agent_write_enabled", true)
+        val promptEnabled = githubPrefs.getBoolean("github_prompt_injection_enabled", true)
+
+        response.put("ok", true)
+        response.put("connected", !token.isNullOrBlank())
+        response.put("username", user)
+        response.put("targetRepo", repo)
+        response.put("targetBranch", branch)
+        response.put("canWrite", writeEnabled)
+        response.put("promptEnabled", promptEnabled)
+        if (!token.isNullOrBlank() && promptEnabled) {
+            response.put("systemPrompt", GitHubAgentPrompt.buildAgentSystemPrompt(user, repo, branch, writeEnabled))
+        }
+    }
+
+    private fun handleFetchGithubListRepos(payload: JSONObject, response: JSONObject) {
+        val token = getEffectiveGithubToken(payload)
+        if (token.isNullOrBlank()) {
+            putGithubError(response, "GitHub token not found. Please log in to GitHub first.", authRejected = true)
+            return
+        }
+        val request = Request.Builder()
+            .url("$githubApiBaseUrl/user/repos?sort=updated&per_page=100&type=all")
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "BetterDeepSeek-Android")
+            .build()
+        try {
+            httpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    putGithubError(response, "GitHub returned ${resp.code} ${resp.message}", status = resp.code)
+                    return
+                }
+                val body = resp.body?.string().orEmpty()
+                val repos = JSONArray(body)
+                response.put("ok", true)
+                response.put("repos", repos)
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put("error", t.message ?: "Failed to list repositories")
+        }
+    }
+
+    private fun handleFetchGithubGetFile(payload: JSONObject, response: JSONObject) {
+        val token = getEffectiveGithubToken(payload)
+        val owner = payload.optString("owner").trim()
+        val repo = payload.optString("repo").trim()
+        val path = payload.optString("path").trimStart('/')
+        val branch = payload.optString("branch").trim()
+        if (owner.isEmpty() || repo.isEmpty() || path.isEmpty()) {
+            response.put("ok", false)
+            response.put("error", "owner, repo, and path are required")
+            return
+        }
+        var url = "$githubApiBaseUrl/repos/$owner/$repo/contents/$path"
+        if (branch.isNotEmpty()) {
+            url += "?ref=" + Uri.encode(branch)
+        }
+        val builder = Request.Builder()
+            .url(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "BetterDeepSeek-Android")
+        if (!token.isNullOrBlank()) {
+            builder.header("Authorization", "Bearer $token")
+        }
+        try {
+            httpClient.newCall(builder.build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    putGithubError(response, "File not found or GitHub returned ${resp.code}", status = resp.code)
+                    return
+                }
+                val body = resp.body?.string().orEmpty()
+                val json = JSONObject(body)
+                val rawContent = json.optString("content", "")
+                val cleanBase64 = rawContent.replace("\n", "").replace("\r", "")
+                val decodedBytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                val text = String(decodedBytes, Charsets.UTF_8)
+                response.put("ok", true)
+                response.put("content", text)
+                response.put("sha", json.optString("sha", ""))
+                response.put("size", json.optLong("size", 0L))
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put("error", t.message ?: "Failed to get file")
+        }
+    }
+
+    private fun handleFetchGithubCommitFile(payload: JSONObject, response: JSONObject) {
+        val token = getEffectiveGithubToken(payload)
+        if (token.isNullOrBlank()) {
+            putGithubError(response, "GitHub token required to commit files. Please log in first.", authRejected = true)
+            return
+        }
+        val owner = payload.optString("owner").trim()
+        val repo = payload.optString("repo").trim()
+        val path = payload.optString("path").trimStart('/')
+        val branch = payload.optString("branch").trim().ifEmpty { "main" }
+        val content = payload.optString("content")
+        val message = payload.optString("message").ifEmpty { "Update $path via Better DeepSeek Agent" }
+        var sha = payload.optString("sha").takeIf { it.isNotEmpty() }
+
+        if (owner.isEmpty() || repo.isEmpty() || path.isEmpty()) {
+            response.put("ok", false)
+            response.put("error", "owner, repo, and path are required")
+            return
+        }
+
+        if (sha == null) {
+            try {
+                val checkReq = Request.Builder()
+                    .url("$githubApiBaseUrl/repos/$owner/$repo/contents/$path?ref=" + Uri.encode(branch))
+                    .header("Authorization", "Bearer $token")
+                    .header("Accept", "application/vnd.github+json")
+                    .header("User-Agent", "BetterDeepSeek-Android")
+                    .build()
+                httpClient.newCall(checkReq).execute().use { checkResp ->
+                    if (checkResp.isSuccessful) {
+                        val body = checkResp.body?.string().orEmpty()
+                        sha = JSONObject(body).optString("sha", null)
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
+        val base64Content = Base64.encodeToString(content.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        val commitJson = JSONObject().apply {
+            put("message", message)
+            put("content", base64Content)
+            put("branch", branch)
+            if (!sha.isNullOrBlank()) {
+                put("sha", sha)
+            }
+        }
+
+        val commitReq = Request.Builder()
+            .url("$githubApiBaseUrl/repos/$owner/$repo/contents/$path")
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "BetterDeepSeek-Android")
+            .put(commitJson.toString().toRequestBody("application/json".toMediaTypeOrNull()))
+            .build()
+
+        try {
+            httpClient.newCall(commitReq).execute().use { resp ->
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    putGithubError(response, "Commit failed: $body", status = resp.code)
+                    return
+                }
+                val respJson = JSONObject(body)
+                val commitObj = respJson.optJSONObject("commit")
+                response.put("ok", true)
+                response.put("commitSha", commitObj?.optString("sha", ""))
+                response.put("htmlUrl", commitObj?.optString("html_url", ""))
+                showToast("تغییرات با موفقیت روی گیت‌هاب کامیت شد ($path)")
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put("error", t.message ?: "Failed to commit file")
+        }
+    }
+
+    private fun handleFetchGithubCreateBranch(payload: JSONObject, response: JSONObject) {
+        val token = getEffectiveGithubToken(payload)
+        if (token.isNullOrBlank()) {
+            putGithubError(response, "GitHub token required to create branch.", authRejected = true)
+            return
+        }
+        val owner = payload.optString("owner").trim()
+        val repo = payload.optString("repo").trim()
+        val newBranch = payload.optString("newBranch").trim()
+        val fromBranch = payload.optString("fromBranch").trim().ifEmpty { "main" }
+
+        try {
+            val refReq = Request.Builder()
+                .url("$githubApiBaseUrl/repos/$owner/$repo/git/ref/heads/" + Uri.encode(fromBranch))
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "BetterDeepSeek-Android")
+                .build()
+            val baseSha = httpClient.newCall(refReq).execute().use { refResp ->
+                if (!refResp.isSuccessful) {
+                    putGithubError(response, "Base branch '$fromBranch' not found.", status = refResp.code)
+                    return
+                }
+                JSONObject(refResp.body?.string().orEmpty()).getJSONObject("object").getString("sha")
+            }
+
+            val createJson = JSONObject().apply {
+                put("ref", "refs/heads/$newBranch")
+                put("sha", baseSha)
+            }
+            val createReq = Request.Builder()
+                .url("$githubApiBaseUrl/repos/$owner/$repo/git/refs")
+                .header("Authorization", "Bearer $token")
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "BetterDeepSeek-Android")
+                .post(createJson.toString().toRequestBody("application/json".toMediaTypeOrNull()))
+                .build()
+
+            httpClient.newCall(createReq).execute().use { createResp ->
+                val body = createResp.body?.string().orEmpty()
+                if (!createResp.isSuccessful) {
+                    putGithubError(response, "Failed to create branch: $body", status = createResp.code)
+                    return
+                }
+                response.put("ok", true)
+                response.put("branch", newBranch)
+                showToast("شاخه جدید $newBranch با موفقیت ایجاد شد")
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put("error", t.message ?: "Failed to create branch")
+        }
+    }
+
+    private fun handleFetchGithubCreatePR(payload: JSONObject, response: JSONObject) {
+        val token = getEffectiveGithubToken(payload)
+        if (token.isNullOrBlank()) {
+            putGithubError(response, "GitHub token required to create pull request.", authRejected = true)
+            return
+        }
+        val owner = payload.optString("owner").trim()
+        val repo = payload.optString("repo").trim()
+        val title = payload.optString("title").trim().ifEmpty { "Update via Better DeepSeek Agent" }
+        val body = payload.optString("body").trim()
+        val head = payload.optString("head").trim()
+        val base = payload.optString("base").trim().ifEmpty { "main" }
+
+        val prJson = JSONObject().apply {
+            put("title", title)
+            put("body", body)
+            put("head", head)
+            put("base", base)
+        }
+
+        val request = Request.Builder()
+            .url("$githubApiBaseUrl/repos/$owner/$repo/pulls")
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "BetterDeepSeek-Android")
+            .post(prJson.toString().toRequestBody("application/json".toMediaTypeOrNull()))
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { resp ->
+                val respBody = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    putGithubError(response, "Failed to create PR: $respBody", status = resp.code)
+                    return
+                }
+                val json = JSONObject(respBody)
+                response.put("ok", true)
+                response.put("htmlUrl", json.optString("html_url", ""))
+                response.put("prNumber", json.optInt("number", 0))
+                showToast("درخواست Pull Request با موفقیت ثبت شد")
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put("error", t.message ?: "Failed to create PR")
+        }
     }
 
     private fun handleFetchGithubZip(payload: JSONObject, response: JSONObject) {

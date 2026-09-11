@@ -10,6 +10,11 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
+import android.view.Gravity
+import android.content.res.ColorStateList
+import com.betterdeepseek.app.github.GitHubAuthDialog
+import com.betterdeepseek.app.github.GitHubService
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -393,6 +398,34 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val gitHubService = GitHubService()
+        val gitHubDialog = GitHubAuthDialog(this, gitHubService) {
+            webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('bds-github-updated'));", null)
+        }
+        bridge.onOpenGitHubSettings = {
+            gitHubDialog.show()
+        }
+
+        val githubFab = FloatingActionButton(this).apply {
+            setImageResource(R.drawable.ic_github)
+            contentDescription = "GitHub Agent Settings"
+            val sizeDp = (44 * resources.displayMetrics.density).toInt()
+            val marginDp = (14 * resources.displayMetrics.density).toInt()
+            val params = FrameLayout.LayoutParams(sizeDp, sizeDp).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = marginDp + (28 * resources.displayMetrics.density).toInt()
+                rightMargin = marginDp
+            }
+            layoutParams = params
+            backgroundTintList = ColorStateList.valueOf(Color.parseColor("#24292F"))
+            imageTintList = ColorStateList.valueOf(Color.WHITE)
+            customSize = sizeDp
+            setOnClickListener {
+                gitHubDialog.show()
+            }
+        }
+        rootLayout.addView(githubFab)
+
         setContentView(rootLayout)
         if (BuildConfig.DEBUG) {
             WebView.setWebContentsDebuggingEnabled(true)
@@ -719,6 +752,10 @@ class MainActivity : ComponentActivity() {
         // startThemeWatcher(), which persists pageIsDark via chrome.storage and fires
         // AndroidBridge.reportTheme() for the live native bar-icon colour update.
         view.evaluateJavascript(content, null)
+        val gitHubBridge = readAsset("bds/github_agent_bridge.js")
+        if (gitHubBridge != null) {
+            view.evaluateJavascript(gitHubBridge, null)
+        }
     }
 
     private fun readAsset(path: String): String? =
