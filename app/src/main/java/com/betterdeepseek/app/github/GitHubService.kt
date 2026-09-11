@@ -192,8 +192,8 @@ class GitHubService(
                         val json = JSONObject(body)
                         val user = GitHubUser(
                             login = json.getString("login"),
-                            name = json.optString("name", null),
-                            avatarUrl = json.optString("avatar_url", null),
+                            name = if (json.has("name") && !json.isNull("name")) json.getString("name") else null,
+                            avatarUrl = if (json.has("avatar_url") && !json.isNull("avatar_url")) json.getString("avatar_url") else null,
                             htmlUrl = json.optString("html_url", "https://github.com"),
                             publicRepos = json.optInt("public_repos", 0),
                             totalPrivateRepos = json.optInt("total_private_repos", 0),
@@ -245,7 +245,7 @@ class GitHubService(
                                     owner = item.getJSONObject("owner").getString("login"),
                                     isPrivate = item.optBoolean("private", false),
                                     defaultBranch = item.optString("default_branch", "main"),
-                                    description = item.optString("description", null),
+                                    description = if (item.has("description") && !item.isNull("description")) item.getString("description") else null,
                                     htmlUrl = item.optString("html_url", "")
                                 )
                             )
@@ -450,8 +450,8 @@ class GitHubService(
                             callback(Result.failure(e))
                         }
 
-                        override fun onResponse(call: okhttp3.Call, createResp: okhttp3.Response) {
-                            createResp.use { cResp ->
+                        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                            response.use { cResp ->
                                 if (cResp.isSuccessful) {
                                     callback(Result.success(true))
                                 } else {

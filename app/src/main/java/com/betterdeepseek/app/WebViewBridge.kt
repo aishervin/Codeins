@@ -1071,7 +1071,8 @@ class WebViewBridge(
                 httpClient.newCall(checkReq).execute().use { checkResp ->
                     if (checkResp.isSuccessful) {
                         val body = checkResp.body?.string().orEmpty()
-                        sha = JSONObject(body).optString("sha", null)
+                        val bodyJson = JSONObject(body)
+                        sha = if (bodyJson.has("sha")) bodyJson.optString("sha") else null
                     }
                 }
             } catch (_: Throwable) {}
